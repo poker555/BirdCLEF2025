@@ -40,6 +40,7 @@ for idx, row in CSA_df.iterrows():
 
     except Exception as e:
         print(f"處理失敗 {file_tail}: {e}")
-
     
+
+  
 
