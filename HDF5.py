@@ -7,10 +7,9 @@ import json
 
 # === 參數區 ===
 MEL_DIR = "C:/Users/brad9/Desktop/BirdCLEF/log_mel_32000kHZ"
-CSV_PATH = "C:/Users/brad9/Desktop/BirdCLEF/updated_train_mel.csv"   # 你的CSV檔
+CSV_PATH = "C:/Users/brad9/Desktop/BirdCLEF/code/merge_train_with_class_labels.csv"  
 HDF5_PATH = "C:/Users/brad9/Desktop/BirdCLEF/all_mel_data.h5"
 RECORD_PATH = "C:/Users/brad9/Desktop/BirdCLEF/hdf5_index_record.csv"
-ORG_IDX_PATH = "C:/Users/brad9/Desktop/BirdCLEF/index/organism_class_to_idx.json"
 
 # 讀取對應的class映射
 with open(ORG_IDX_PATH) as f:
