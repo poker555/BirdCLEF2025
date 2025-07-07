@@ -1,18 +1,14 @@
-import os
 import pandas as pd
-import json
 
-train_csv_path = 'C:/Users/brad9/Desktop/BirdCLEF/train.csv'
-taxonomy_csv_path = 'C:/Users/brad9/Desktop/BirdCLEF/taxonomy.csv'
+# 讀取csv
+df = pd.read_csv(r'C:\Users\brad9\Desktop\BirdCLEF\log_mel.csv')
 
-merge = pd.merge(
-    pd.read_csv(train_csv_path),
-    pd.read_csv(taxonomy_csv_path),
-    on='primary_label',
-    how='left'
-)
+# 假設mel_filename格式為 1139490\CSA36385_seg0.npy
+# Windows分隔符號是 \
+df['folder_id'] = df['mel_filename'].apply(lambda x: str(x).split('\\')[0])
 
-columns_to_drop = ['type','url','latitude','longitude','license','author','secondary_labels']
-merge = merge.drop(columns=columns_to_drop)
+# 檢查結果
+print(df[['mel_filename', 'folder_id']].head())
 
-merge.to_csv('C:/Users/brad9/Desktop/BirdCLEF/merged_train.csv', index=False)
+# 儲存新檔案
+df.to_csv(r'C:\Users\brad9\Desktop\BirdCLEF\log_mel_v2.csv', index=False)
