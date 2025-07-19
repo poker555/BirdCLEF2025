@@ -1,112 +1,151 @@
 import os
-import json
-import librosa
-import numpy as np
 import pandas as pd
+import numpy as np
+import soundfile as sf
+import h5py
+from sklearn.model_selection import GroupShuffleSplit
 from tqdm import tqdm
-import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing as mp
 
-# === 載入設定檔 ===
-def load_config(config_path):
-    with open(config_path) as f:
-        return json.load(f)
-
-# === 音訊處理 ===
-def process_audio_file(file_path, config):
-    y, sr = librosa.load(file_path, sr=config["sample_rate"], mono=config["mono"])
-
-    if config["apply_trim"]:
-        y, _ = librosa.effects.trim(y, top_db=config["trim_top_db"])
-
-    if config["apply_denoise"]:
-        y = librosa.effects.preemphasis(y)
-
-    rms = np.sqrt(np.mean(y ** 2))
-    if rms > 0:
-        y *= config["rms_target"] / (rms + 1e-9)
-
-    segment_length = int(config["sample_rate"] * config["segment_duration_sec"])
-    total_segments = len(y) // segment_length
-
-    segments = []
-    for i in range(total_segments):
-        seg = y[i * segment_length: (i + 1) * segment_length]
-        segments.append(seg)
-
-    return segments, sr
-
-# === 頻譜圖轉換與正規化 ===
-def audio_to_logmel(segment, sr, config):
-    mel_cfg = config["mel_spectrogram"]
+def process_row(args):
+    idx, row_dict, mel_shape1, N_MELS, SAMPLE_RATE, TARGET_LEN, HOP_LENGTH, FILE_BASE = args
+    import librosa
+    import numpy as np
+    import os
+    audio_path = os.path.join(FILE_BASE, row_dict['filename'])
+    seg = int(row_dict['segment_id'].split('_seg')[-1])
+    try:
+        y, sr = librosa.load(audio_path, sr=SAMPLE_RATE)
+    except Exception as e:
+        print(f"讀取失敗：{audio_path}, {e}")
+        return idx, None, None
+    if len(y) < TARGET_LEN:
+        y = np.pad(y, (0, TARGET_LEN - len(y)))
+        slices = [y]
+    else:
+        slices = [y[i:i+TARGET_LEN] for i in range(0, len(y)-TARGET_LEN+1, TARGET_LEN)]
+    y_slice = slices[seg]
     mel = librosa.feature.melspectrogram(
-        y=segment,
-        sr=sr,
-        n_fft=mel_cfg["n_fft"],
-        hop_length=mel_cfg["hop_length"],
-        n_mels=mel_cfg["n_mels"],
-        fmin=mel_cfg["fmin"],
-        fmax=mel_cfg["fmax"],
-        power=mel_cfg["power"]
+        y=y_slice, sr=SAMPLE_RATE,
+        n_mels=N_MELS, hop_length=HOP_LENGTH, power=2.0
     )
+    mel = librosa.power_to_db(mel, ref=np.max)
+    if mel.shape[1] < mel_shape1:
+        pad_width = mel_shape1 - mel.shape[1]
+        mel = np.pad(mel, ((0,0),(0,pad_width)), mode='constant')
+    elif mel.shape[1] > mel_shape1:
+        mel = mel[:, :mel_shape1]
+    label_arr = np.array(list(map(int, row_dict["onehot"].split(","))), dtype=np.float32)
+    return idx, mel.astype(np.float32), label_arr
 
-    if config["log_scaling"]["apply_log_db"]:
-        mel = librosa.power_to_db(mel, ref=np.max if config["log_scaling"]["ref_power"] == "max" else 1.0)
-
-    norm_cfg = config["normalization"]
-    if norm_cfg["type"] == "per_image_zscore":
-        mean = np.mean(mel)
-        std = np.std(mel)
-        mel = (mel - mean) / (std + norm_cfg["epsilon"])
-    elif norm_cfg["type"] == "minmax":
-        mel = (mel - np.min(mel)) / (np.max(mel) - np.min(mel) + norm_cfg["epsilon"])
-
-    return mel
-
-# === 主流程：整批處理與更新 CSV ===
-def process_dataset_and_update_csv(csv_path, audio_base_dir, output_dir, output_csv_path, config_path):
-    config = load_config(config_path)
-    df = pd.read_csv(csv_path)
-    updated_rows = []
-
-    for idx, row in tqdm(df.iterrows(), total=len(df)):
-        audio_rel_path = row["filename"]
-        audio_path = os.path.join(audio_base_dir, audio_rel_path)
-
-        if not os.path.exists(audio_path):
-            continue
-
-        try:
-            segments, sr = process_audio_file(audio_path, config)
-            base_name = os.path.splitext(os.path.basename(audio_path))[0]
-            rel_dir = os.path.dirname(audio_rel_path)
-
-            output_subdir = os.path.join(output_dir, rel_dir)
-            os.makedirs(output_subdir, exist_ok=True)
-
-            for i, seg in enumerate(segments):
-                mel = audio_to_logmel(seg, sr, config)
-                out_name = f"{base_name}_seg{i}.npy"
-                out_path = os.path.join(output_subdir, out_name)
-                np.save(out_path, mel)
-
-                new_row = row.copy()
-                new_row["mel_filename"] = os.path.join(rel_dir, out_name)
-                updated_rows.append(new_row)
-
-        except Exception as e:
-            print(f"❌ Error: {audio_path} | {e}")
-            traceback.print_exc()
-
-    out_df = pd.DataFrame(updated_rows)
-    out_df.to_csv(output_csv_path, index=False)
-    print(f"✅ 完成處理 {len(updated_rows)} 個切片，儲存於 {output_csv_path}")
-
-# === 主程式執行區段 ===
 if __name__ == "__main__":
-    process_dataset_and_update_csv(
-        csv_path="C:/Users/brad9/Desktop/BirdCLEF/train.csv",
-        audio_base_dir="C:/Users/brad9/Desktop/BirdCLEF/train_audio",
-        output_dir="C:/Users/brad9/Desktop/BirdCLEF/log_mel_16000kHZ",
-        output_csv_path="C:/Users/brad9/Desktop/BirdCLEF/updated_train_mel.csv",
-        config_path="C:/Users/brad9/Desktop/BirdCLEF/audio_preprocessing_config.json"
-    )
+    # ====== 基本設定 ======
+    FILE_BASE = r"C:\Users\brad9\Desktop\BirdCLEF++\train_audio"
+    CSV_PATH = r"C:\Users\brad9\Desktop\BirdCLEF++\train.csv"
+    OUTPUT_H5 = r"C:\Users\brad9\Desktop\BirdCLEF++\train_v2.h5"
+    OUTPUT_CSV = r"C:\Users\brad9\Desktop\BirdCLEF++\train_v2.csv"
+    TARGET_DURATION = 5  # 秒
+    SAMPLE_RATE = 32000
+    TARGET_LEN = TARGET_DURATION * SAMPLE_RATE
+    N_MELS = 128
+    HOP_LENGTH = 512
+    MAX_THREADS = 8  # 依主機核心數調整
+
+    # ====== 1. 讀取資料和標籤編碼 ======
+    df = pd.read_csv(CSV_PATH)
+    all_labels = set()
+    for label_str in df['primary_label']:
+        all_labels.update([l.strip() for l in str(label_str).split(',')])
+    all_labels = sorted(list(all_labels))
+    label2idx = {label: idx for idx, label in enumerate(all_labels)}
+
+    def encode_labels(label_str):
+        onehot = np.zeros(len(all_labels), dtype=int)
+        if pd.isna(label_str): return onehot
+        for l in str(label_str).split(','):
+            l = l.strip()
+            if l in label2idx:
+                onehot[label2idx[l]] = 1
+        return onehot
+
+    # ====== 2. 多執行緒取得音檔長度 ======
+    def get_audio_length(row):
+        audio_path = os.path.join(FILE_BASE, row['filename'])
+        try:
+            info = sf.info(audio_path)
+            return row['filename'], info.frames
+        except Exception as e:
+            print(f"讀取失敗：{audio_path}, {e}")
+            return row['filename'], 0
+
+    audio_lengths = {}
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        futures = [executor.submit(get_audio_length, row) for _, row in df.iterrows()]
+        for fut in tqdm(as_completed(futures), total=len(df), desc="多執行緒讀音檔長度"):
+            fn, length = fut.result()
+            audio_lengths[fn] = length
+
+    # ====== 3. 計算全部切片數 ======
+    total_slices = 0
+    slices_dict = {}
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="計算切片數"):
+        audio_len = audio_lengths[row['filename']]
+        if audio_len == 0:
+            slices = 0
+        elif audio_len < TARGET_LEN:
+            slices = 1
+        else:
+            slices = int(np.floor((audio_len-TARGET_LEN)/TARGET_LEN+1))
+            slices = max(slices, 1)
+        slices_dict[row['filename']] = slices
+        total_slices += slices
+    print(f"全部切片數: {total_slices}")
+
+    # ====== 4. 分割 train/valid 與 meta（onehot存同一欄） ======
+    meta_records = []
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="資料分割與meta紀錄"):
+        audio_len = audio_lengths[row['filename']]
+        slices = slices_dict[row['filename']]
+        if slices == 0:
+            continue
+        onehot = encode_labels(row['primary_label'])
+        onehot_str = ','.join(map(str, onehot))  # 例如 '0,1,1,0,0,0'
+        for i in range(slices):
+            meta_records.append({
+                "filename": row["filename"],
+                "primary_label": row["primary_label"],
+                "segment_id": f"{row['filename']}_seg{i}",
+                "onehot": onehot_str
+            })
+
+    new_df = pd.DataFrame(meta_records)
+    gss = GroupShuffleSplit(n_splits=1, train_size=0.8, random_state=42)
+    groups = new_df['filename']
+    train_idx, valid_idx = next(gss.split(new_df, groups=groups))
+    new_df = new_df.reset_index(drop=True)
+    new_df['split'] = "none"
+    new_df.loc[train_idx, 'split'] = 'train'
+    new_df.loc[valid_idx, 'split'] = 'valid'
+    new_df.to_csv(OUTPUT_CSV, index=False)
+
+    # ====== 5. Mel 平行處理與 HDF5 寫入 ======
+    mel_shape1 = int(np.ceil(TARGET_LEN / HOP_LENGTH))
+    args_list = [
+        (idx, row.to_dict(), mel_shape1, N_MELS, SAMPLE_RATE, TARGET_LEN, HOP_LENGTH, FILE_BASE)
+        for idx, row in new_df.iterrows()
+    ]
+    with h5py.File(OUTPUT_H5, "w") as h5f:
+        mel_ds = h5f.create_dataset("mel", shape=(len(new_df), N_MELS, mel_shape1), dtype=np.float32)
+        label_ds = h5f.create_dataset("label", shape=(len(new_df), len(all_labels)), dtype=np.float32)
+        split_ds = h5f.create_dataset("split", shape=(len(new_df),), dtype='S5')
+        segid_ds = h5f.create_dataset("segment_id", shape=(len(new_df),), dtype=h5py.string_dtype())
+        with mp.Pool(processes=mp.cpu_count()) as pool:
+            for idx, mel, label in tqdm(pool.imap_unordered(process_row, args_list), total=len(args_list), desc="平行處理寫入HDF5"):
+                if mel is None:
+                    continue
+                mel_ds[idx] = mel
+                label_ds[idx] = label
+                split_ds[idx] = new_df.loc[idx, 'split'].encode()
+                segid_ds[idx] = new_df.loc[idx, 'segment_id']
+        print(f"已存入 HDF5：{OUTPUT_H5}")

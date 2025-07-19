@@ -1,114 +1,86 @@
 import os
-import json
-import glob
 import torch
-import pandas as pd
-import librosa
 import timm
+import librosa
 import numpy as np
+import pandas as pd
+from tqdm import tqdm
 
-# ================= 路徑設定 =================
-soundscape_path = r"C:\Users\brad9\Desktop\BirdCLEF\train_soundscapes"
-taxonomy_path = r"C:\Users\brad9\Desktop\BirdCLEF\taxonomy.csv"
-logmel_path = r"C:\Users\brad9\Desktop\BirdCLEF\log_mel_v2.csv"
-submit_csv_path = r"C:\Users\brad9\Desktop\BirdCLEF\submit.csv"
-CONFIG_PATH = r"C:\Users\brad9\Desktop\BirdCLEF\audio_preprocessing_config.json"
-model_path_dict = {
-    "Insecta": r"C:\Users\brad9\Desktop\BirdCLEF\model\best_model_Insecta.pth",
-    "Aves": r"C:\Users\brad9\Desktop\BirdCLEF\model\best_model_Aves.pth",
-    "Amphibia": r"C:\Users\brad9\Desktop\BirdCLEF\model\best_model_Amphibia.pth",
-    "Mammalia": r"C:\Users\brad9\Desktop\BirdCLEF\model\best_model_Mammalia.pth",
-    "all": r"C:\Users\brad9\Desktop\BirdCLEF\model\best_model.pth",
-}
-num_classes_dict = {"Insecta": 16, "Aves": 146, "Amphibia": 34, "Mammalia": 9, "all": 4}
-segment_sec = 5
+# 參數區
+SOUNDSCAPE_DIR = r"C:\Users\brad9\Desktop\BirdCLEF++\train_soundscapes"
+MODEL_PATH = r"C:\Users\brad9\Desktop\BirdCLEF++\best_model_v2.pth"
+OUTPUT_CSV = r"C:\Users\brad9\Desktop\BirdCLEF++\submission.csv"
+SAMPLE_SUB_CSV = r"C:\Users\brad9\Desktop\BirdCLEF++\sample_submission.csv"
+IMG_SIZE = 300
+SAMPLE_RATE = 32000
+TARGET_LEN = 5 * SAMPLE_RATE
+N_MELS = 128
+HOP_LENGTH = 512
 
-# ================ 資料準備 =================
-taxonomy_df = pd.read_csv(taxonomy_path)
-logmel_df = pd.read_csv(logmel_path)
-with open(CONFIG_PATH) as f:
-    config = json.load(f)
+# === 讀取 submission 欄位/物種 ===
+sample_sub = pd.read_csv(SAMPLE_SUB_CSV)
+target_cols = [c for c in sample_sub.columns if c != 'row_id']
 
-# submit.csv 的所有欄位
-submit_columns = ['row'] + taxonomy_df['primary_label'].tolist()
+# 取得全部 ogg 路徑
+# #audio_files = [os.path.join(SOUNDSCAPE_DIR, f) for f in os.listdir(SOUNDSCAPE_DIR) if f.endswith('.ogg')]
+audio_files = [os.path.join(SOUNDSCAPE_DIR, f) for f in os.listdir(SOUNDSCAPE_DIR) if f.endswith('.ogg')][:10]
 
-# ================ 載入模型 =================
-def load_model(model_path, num_classes):
-    model = timm.create_model('efficientnet_b3', pretrained=False, num_classes=num_classes, in_chans=1)
-    model.load_state_dict(torch.load(model_path, map_location='cpu'))
-    model.eval()
+# 建立 EfficientNetB3（跟訓練一致）
+def get_model(num_classes):
+    model = timm.create_model('efficientnet_b3', pretrained=True, in_chans=3)
+    model.classifier = torch.nn.Linear(model.classifier.in_features, num_classes)
     return model
 
-model_all = load_model(model_path_dict["all"], 4)
-model_dict = {
-    group: load_model(model_path_dict[group], num_classes_dict[group])
-    for group in ["Insecta", "Aves", "Amphibia", "Mammalia"]
-}
+device = "cuda" if torch.cuda.is_available() else "cpu"
+num_classes = len(target_cols)
+model = get_model(num_classes).to(device)
+model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+model.eval()
 
-# ================ 音訊切片前處理 ===============
-def preprocess_segment(segment, sr, config):
-    if config.get("apply_denoise", False):
-        segment = librosa.effects.preemphasis(segment)
-    rms = np.sqrt(np.mean(segment ** 2))
-    if rms > 0:
-        segment *= config["rms_target"] / (rms + 1e-9)
-    mel_cfg = config["mel_spectrogram"]
-    melspec = librosa.feature.melspectrogram(
-        y=segment, sr=sr,
-        n_fft=mel_cfg["n_fft"], hop_length=mel_cfg["hop_length"],
-        n_mels=mel_cfg["n_mels"], fmin=mel_cfg["fmin"], fmax=mel_cfg["fmax"],
-        power=mel_cfg["power"]
-    )
-    if config["log_scaling"]["apply_log_db"]:
-        logmelspec = librosa.power_to_db(melspec, ref=np.max)
-    else:
-        logmelspec = melspec
-    norm_cfg = config["normalization"]
-    mean, std = np.mean(logmelspec), np.std(logmelspec)
-    logmelspec = (logmelspec - mean) / (std + norm_cfg["epsilon"])
-    return logmelspec
-
-# ================== 推論與輸出 ==================
-submit_rows = []
-ogg_files = glob.glob(os.path.join(soundscape_path, '*.ogg'), recursive=True)
-ogg_files = ogg_files[:10]  # 只取前 10 筆音檔進行測試
-
-for file_path in ogg_files:
-    y, sr = librosa.load(file_path, sr=None)
-    total_sec = int(np.ceil(len(y) / sr))
-    file_id = os.path.splitext(os.path.basename(file_path))[0]
-
-    for start in range(0, total_sec, segment_sec):
-        end = min(start + segment_sec, total_sec)
-        segment = y[start*sr:end*sr]
-        if len(segment) < sr:
-            continue
-        row_id = f"{file_id}_{end}"
-        logmelspec = preprocess_segment(segment, sr, config)
-        input_tensor = torch.tensor(logmelspec).unsqueeze(0).unsqueeze(0).float()
-
-        new_row = dict.fromkeys(submit_columns, None)
-        new_row['row'] = row_id
-
+# == 預測主流程 ==
+results = []
+for file in tqdm(audio_files, desc="預測 soundscape"):
+    y, sr = librosa.load(file, sr=SAMPLE_RATE)
+    if len(y) < 60 * SAMPLE_RATE:
+        y = np.pad(y, (0, 60 * SAMPLE_RATE - len(y)))
+    basename = os.path.splitext(os.path.basename(file))[0]
+    # 切片（每 5 秒，共 12 片）
+    for seg_idx, t_start in enumerate(range(0, 60, 5)):
+        start_sample = t_start * SAMPLE_RATE
+        end_sample = start_sample + TARGET_LEN
+        y_slice = y[start_sample:end_sample]
+        if len(y_slice) < TARGET_LEN:
+            y_slice = np.pad(y_slice, (0, TARGET_LEN - len(y_slice)))
+        # Mel 頻譜
+        mel = librosa.feature.melspectrogram(
+            y=y_slice, sr=SAMPLE_RATE,
+            n_mels=N_MELS, hop_length=HOP_LENGTH, power=2.0
+        )
+        mel = librosa.power_to_db(mel, ref=np.max)
+        mel = torch.tensor(mel, dtype=torch.float32)
+        mel = mel.unsqueeze(0).repeat(3, 1, 1)
+        mel = torch.nn.functional.interpolate(
+            mel.unsqueeze(0), size=(IMG_SIZE, IMG_SIZE), mode='bilinear', align_corners=False
+        ).squeeze(0).unsqueeze(0)
+        mel = mel.to(device)
+        # 預測
         with torch.no_grad():
-            # 先用 model_all 判斷是哪個物種
-            probs_all = torch.softmax(model_all(input_tensor), dim=1)
-            idx = int(torch.argmax(probs_all))
-            group = {0: "Insecta", 1: "Amphibia", 2: "Mammalia", 3: "Aves"}[idx]
+            logits = model(mel)
+            probs = torch.sigmoid(logits).cpu().numpy()[0]
+        # row_id 用結束秒數
+        row_id = f"{basename}_{t_start+5}"
+        row = {'row_id': row_id}
+        for i, col in enumerate(target_cols):
+            row[col] = probs[i]
+        results.append(row)
 
-            model = model_dict[group]
-            class_col = f'class_name_{group}'
-            class_map = logmel_df[[class_col, 'folder_id']].drop_duplicates()
-            idx_to_folderid = dict(zip(class_map[class_col], class_map['folder_id']))
-            probs = torch.softmax(model(input_tensor), dim=1).squeeze().cpu().numpy()
-
-            for i in range(len(probs)):
-                folder_id = idx_to_folderid.get(i)
-                if folder_id in new_row:
-                    new_row[folder_id] = float(probs[i])
-        submit_rows.append(new_row)
-
-submit_csv = pd.DataFrame(submit_rows, columns=submit_columns)
-submit_csv = submit_csv.fillna(0)
-submit_csv.to_csv(submit_csv_path, index=False)
-print("輸出完成！檔案已儲存：", submit_csv_path)
+# 匯出 CSV，欄位與 sample_submission 一致
+out_df = pd.DataFrame(results)
+# 若有缺欄位，自動補0（通常不會發生）
+for c in target_cols:
+    if c not in out_df:
+        out_df[c] = 0.0
+# 保持欄位順序
+out_df = out_df[['row_id'] + target_cols]
+out_df.to_csv(OUTPUT_CSV, index=False, float_format="%.8f")
+print(f"已產生 submission: {OUTPUT_CSV}")
